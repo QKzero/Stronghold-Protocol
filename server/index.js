@@ -44,6 +44,7 @@
 import http from 'node:http';
 import path from 'node:path';
 import { getData, loadData } from './data.js';
+import { createPrefsLoadout } from './prefsLoadout.js';
 import { getBotStrategy, getBotStrategySeats } from './match/botStrategies.js';
 import { noteLlmIgnored, releaseIgnoresExternalAi, validateExternalConfig } from './match/llmGate.js';
 import { ROOT, listenAddress, bindCandidates, serveDirs, makeLogger, parseTrustProxy, assetIndexOptionsFrom, versionsFrom, parseRoomCode } from './http/config.js';
@@ -136,6 +137,8 @@ export async function startServer(opts = {}) {
 
   // The process-wide singleton serves the default data dir; a custom dir (tests) gets its own copy.
   const data = opts.dataDir ? loadData(dataDir, { log }) : getData({ dir: dataDir, log });
+  // Optional sidecar: nickname-keyed loadout persistence in <cwd>/dataSQL (SP_PREFS=1; null when off)
+  const prefs = await createPrefsLoadout({ log, data });
   // the vanilla content hash `cs` (DESIGN §32): the bytes of the served sim, shared code and game data, read once now —
   // like the data the matches use and the build tag below
   const content = computeVanillaContent({ simDir, sharedDir, dataDir, shim: DATA_SHIM_JS, log });
@@ -201,7 +204,7 @@ export async function startServer(opts = {}) {
   buildTag(ROOT, { servedVersionDirs: versions.servedDirs() });
 
   const traffic = createTrafficCounter();
-  const server = http.createServer(createRequestHandler({ serveStatic, csp: process.env.SP_CSP === 'off' ? null : siteCsp(publicDir), health: { startedAt, network, registry, lobby, content, traffic, assetIndex, views, trusted:trustedRuntime?.health, versions, versionHosts }, log, trustProxy: network.opts.trustProxy, studio, trustedRuntime }));
+  const server = http.createServer(createRequestHandler({ serveStatic, csp: process.env.SP_CSP === 'off' ? null : siteCsp(publicDir), health: { startedAt, network, registry, lobby, content, traffic, assetIndex, views, trusted:trustedRuntime?.health, versions, versionHosts }, log, trustProxy: network.opts.trustProxy, studio, trustedRuntime, prefs }));
   server.on('clientError', answerClientError);
   const wss = attachWebSocket(server, { network, log, traffic });
 
@@ -254,6 +257,7 @@ export async function startServer(opts = {}) {
     eventLoop?.close();
     await simPool?.close();
     await trustedRuntime?.close();
+    prefs?.close();
     throw e;
   }
   server.on('error', (e) => log.error('[http] server error', e));
@@ -279,6 +283,7 @@ export async function startServer(opts = {}) {
       assetIndex?.close();
       studio?.close();
       await trustedRuntime?.close();
+      prefs?.close();
       await new Promise((resolve) => {
         server.close(() => resolve());
         server.closeIdleConnections?.();

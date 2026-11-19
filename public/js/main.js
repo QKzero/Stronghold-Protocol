@@ -66,7 +66,8 @@ import { StatsHost, useStatsOpen } from './screens/stats.js';
 import { CoveredVersionVote } from './ui/versionVote.js';
 import { installRehearsal } from './battle/rehearsal.js';
 import { recordResult, installStatsRecorder } from './ui/stats.js';
-import { installLoadoutSync, installOwnershipSync, installDiySync, installSkinsSync, installCardSync, installSettingsViews, loadoutStore } from './ui/loadoutSync.js';
+import { installLoadoutSync, installOwnershipSync, installDiySync, installSkinsSync, installCardSync, installSettingsViews, loadoutStore, canSendSettings } from './ui/loadoutSync.js';
+import { initPrefsLoadout, prefsGate } from './prefsLoadout.js';
 import { startBuildGuard } from './ui/buildGuard.js';
 import { initLang, useLang, tickerText } from './ui/lang.js';
 import { t, N_, translateWire } from '../../shared/i18n.js';
@@ -443,7 +444,7 @@ async function boot() {
   installStatsRecorder(store); // follows the match on screen, so a 放弃模拟 can be recorded (ui/stats.js)
   // the loadout / 干员持有 / 自选 settings by operator, shown for the data on screen (DESIGN §35.23; a v1 store migrates)
   installSettingsViews();
-  installLoadoutSync({ net });
+  const loadoutSync = installLoadoutSync({ net, gate: (ctx) => prefsGate() && canSendSettings(ctx) });
   installOwnershipSync({ net });
   installDiySync({ net });
   // 干员皮肤 (docs/SKINS.md): keeps the server's copy of this browser's chosen appearances current (room.skins), from
@@ -452,6 +453,8 @@ async function boot() {
   // 名片干员 (PR #643 split 6): the operator on this browser's seat card (room.card, ui/seatArt.js cardStore) — after every
   // welcome, pick and content change, with the engine's retries (the room screen only reads and sets the pick)
   installCardSync({ net });
+  // 干员调配的跨浏览器恢复（仅 loadout，按昵称；SP_PREFS=1 时服务端才有 /prefs/loadout）
+  initPrefsLoadout({ net, onReady: () => { void loadoutSync.flush(); } });
   // the room's cosmetic plugins and the player's own over the art manifest (content.js; nothing is fetched without them)
   installContent({ toast });
   // a room with gameplay plugins: its content set downloaded, checked and shown (content.js — DESIGN §32.6)

@@ -58,6 +58,9 @@ scripts/service.env.cmd
 .env
 .env.*
 
+# 本地干员配置 SQLite
+/dataSQL/
+
 # --- OS / editor clutter ---------------------------------------------------------------------------
 .DS_Store
 Thumbs.db
