@@ -31,7 +31,7 @@ function normalizeName(raw) {
 }
 
 /** 存储键：规范化昵称再小写，避免大小写/全半角差异产生两个档案。 */
-function profileKey(name) {
+function userCode(name) {
   return crypto.createHash('sha256').update(name.normalize('NFC').toLowerCase(), 'utf8').digest('hex');
 }
 
@@ -145,21 +145,23 @@ export async function createPrefsLoadout({ log = console, data: defaultData = nu
     db.exec('PRAGMA journal_mode=WAL');
     db.exec('PRAGMA synchronous=NORMAL');
     db.exec('PRAGMA busy_timeout=3000');
+    // user：一个规范化昵称一条用户档案；user_code 是昵称哈希，作为跨浏览器恢复的稳定标识。
+    // preference：按「用户 + 偏好类型 + 官方版本」保存一条偏好；当前 type 只写 'loadout'。
     db.exec(`
-      CREATE TABLE IF NOT EXISTS profile (
-        key TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
+      CREATE TABLE IF NOT EXISTS "user" (
+        user_code TEXT PRIMARY KEY,     -- 昵称哈希：sha256(规范化昵称小写)，不含明文昵称
+        name TEXT NOT NULL,             -- 规范化后的显示昵称（NFC、去首尾/压缩空白）
+        create_time INTEGER NOT NULL,   -- 首次建档时间（毫秒时间戳）
+        modify_time INTEGER NOT NULL    -- 最后一次写入时间（毫秒时间戳）
       );
-      CREATE TABLE IF NOT EXISTS pref (
-        key TEXT NOT NULL,
-        kind TEXT NOT NULL,
-        version TEXT NOT NULL,
-        payload TEXT NOT NULL,
-        rev INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL,
-        PRIMARY KEY (key, kind, version)
+      CREATE TABLE IF NOT EXISTS preference (
+        user_code TEXT NOT NULL,        -- 关联 user.user_code
+        type TEXT NOT NULL,             -- 偏好类型；当前固定为 'loadout'（干员调配）
+        slug_version TEXT NOT NULL,     -- 官方版本 id（如 act2autochess@V2_1），按版本隔离配置
+        "value" TEXT NOT NULL,          -- 偏好内容 JSON：{ byChar: { charId: 技能/模组 }, ops: { charId: 潜能/练度 } }
+        row_version INTEGER NOT NULL,   -- 乐观锁修订号：每次成功写入 +1，用于 409 冲突检测
+        modify_time INTEGER NOT NULL,   -- 本条偏好的最后修改时间（毫秒时间戳）
+        PRIMARY KEY (user_code, type, slug_version)
       );
     `);
   } catch (e) {
@@ -168,21 +170,24 @@ export async function createPrefsLoadout({ log = console, data: defaultData = nu
     return null;
   }
 
-  const selectPref = db.prepare('SELECT payload, rev, updated_at FROM pref WHERE key = ? AND kind = ? AND version = ?');
-  const upsertProfile = db.prepare(`
-    INSERT INTO profile (key, name, created_at, updated_at) VALUES (?, ?, ?, ?)
-    ON CONFLICT(key) DO UPDATE SET name = excluded.name, updated_at = excluded.updated_at
+  // 读取某用户在某官方版本下的 loadout；row_version 即客户端保存时携带的 baseRev。
+  const selectPreference = db.prepare('SELECT "value", row_version, modify_time FROM preference WHERE user_code = ? AND type = ? AND slug_version = ?');
+  // 用户档案 upsert：create_time 只在首次插入时写入，后续只更新昵称与 modify_time。
+  const upsertUser = db.prepare(`
+    INSERT INTO "user" (user_code, name, create_time, modify_time) VALUES (?, ?, ?, ?)
+    ON CONFLICT(user_code) DO UPDATE SET name = excluded.name, modify_time = excluded.modify_time
   `);
-  const upsertPref = db.prepare(`
-    INSERT INTO pref (key, kind, version, payload, rev, updated_at) VALUES (?, ?, ?, ?, ?, ?)
-    ON CONFLICT(key, kind, version) DO UPDATE SET payload = excluded.payload, rev = excluded.rev, updated_at = excluded.updated_at
+  // 偏好 upsert：同一 (user_code, type, slug_version) 覆盖 value、row_version 与 modify_time。
+  const upsertPreference = db.prepare(`
+    INSERT INTO preference (user_code, type, slug_version, "value", row_version, modify_time) VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(user_code, type, slug_version) DO UPDATE SET "value" = excluded."value", row_version = excluded.row_version, modify_time = excluded.modify_time
   `);
 
   const parseRow = (row) => {
     if (!row) return null;
     try {
-      const payload = JSON.parse(row.payload);
-      return isPlain(payload) ? { payload, rev: Number(row.rev) || 0, updatedAt: Number(row.updated_at) || 0 } : null;
+      const payload = JSON.parse(row.value);
+      return isPlain(payload) ? { payload, rev: Number(row.row_version) || 0, updatedAt: Number(row.modify_time) || 0 } : null;
     } catch {
       log.warn('[prefs] ignoring a malformed stored payload');
       return null;
@@ -190,12 +195,12 @@ export async function createPrefsLoadout({ log = console, data: defaultData = nu
   };
 
   function load(name, version) {
-    return parseRow(selectPref.get(profileKey(name), 'loadout', version));
+    return parseRow(selectPreference.get(userCode(name), 'loadout', version));
   }
 
   function save(name, version, payload, baseRev) {
-    const key = profileKey(name);
-    const existing = parseRow(selectPref.get(key, 'loadout', version));
+    const code = userCode(name);
+    const existing = parseRow(selectPreference.get(code, 'loadout', version));
     const currentRev = existing?.rev ?? 0;
     if (baseRev != null && Number(baseRev) !== currentRev) {
       return { conflict: true, rev: currentRev, payload: existing?.payload ?? null };
@@ -209,8 +214,8 @@ export async function createPrefsLoadout({ log = console, data: defaultData = nu
     const nextRev = currentRev + 1;
     db.exec('BEGIN IMMEDIATE');
     try {
-      upsertProfile.run(key, name, now, now);
-      upsertPref.run(key, 'loadout', version, JSON.stringify(payload), nextRev, now);
+      upsertUser.run(code, name, now, now);
+      upsertPreference.run(code, 'loadout', version, JSON.stringify(payload), nextRev, now);
       db.exec('COMMIT');
     } catch (e) {
       try { db.exec('ROLLBACK'); } catch { /* ignore */ }
