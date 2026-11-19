@@ -1,13 +1,15 @@
-// public/js/prefsLoadout.js — 干员调配的跨浏览器恢复（仅 loadout，按昵称）。
-// 旁路在游戏同步之外：welcome 后 GET /prefs/loadout；本地为空才灌回，随后放行 room.loadout；
-// 之后订阅 loadoutStore 的 byChar / ops，去抖 POST。服务端未启用（404）时本模块整体停用。
+// public/js/prefsLoadout.js — 干员调配 + 自选编队的跨浏览器恢复（按昵称）。
+// 旁路在游戏同步之外：welcome 后并行 GET /prefs/loadout（kind=loadout / kind=diy）；
+// 本地为空才灌回，随后放行 room.loadout / room.diy；之后订阅两个 store，去抖 POST。
+// 服务端未启用（404）时本模块整体停用。
 
 import { savePref, store } from './store.js';
-import { loadoutStore, refreshViews } from './ui/loadoutSync.js';
+import { loadoutStore, refreshViews, setDiyPicks } from './ui/loadoutSync.js';
 import { LOADOUT_PREF, toStored } from './ui/loadoutModel.js';
 import { pageVersion } from './content.js';
 
 const ENDPOINT = '/prefs/loadout';
+const KINDS = ['loadout', 'diy'];
 const SAVE_DELAY_MS = 1200;
 const FAST_TIMEOUT_MS = 3000;
 
@@ -19,16 +21,19 @@ let enabled = true;
 let started = false;
 let name = null;
 let version = null;
-let rev = 0;
 let loadedKey = null;
 let syncingKey = null;
 let syncSeq = 0;
 let applying = false;
-let dirty = false;
 let timer = null;
 let onReadyCb = null;
 
-/** installLoadoutSync 的 gate：偏好拉取完成前不发送 room.loadout。 */
+/** 每类偏好的 row_version，冲突重试时更新。 */
+const revs = { loadout: 0, diy: 0 };
+/** 每类偏好是否有待上传的修改。 */
+const dirty = { loadout: false, diy: false };
+
+/** installLoadoutSync / installDiySync 的 gate：偏好拉取完成前不发送游戏消息。 */
 export const prefsGate = () => ready;
 
 function notifyReady() {
@@ -37,23 +42,34 @@ function notifyReady() {
   }
 }
 
-function currentPayload() {
+function currentPayload(kind) {
+  if (kind === 'diy') return { picks: loadoutStore.get().diy || {} };
   const s = loadoutStore.get();
   return { byChar: s.byChar || {}, ops: s.ops || {} };
 }
 
-/** 只要本地有任何一种已存形态（byChar / ops / 旧 entries），就认为本地非空。 */
-function localEmpty() {
+function hasPayload(kind, payload) {
+  if (!isObj(payload)) return false;
+  return kind === 'diy' ? hasKeys(payload.picks) : (hasKeys(payload.byChar) || hasKeys(payload.ops));
+}
+
+/** 只要本地有任何一种已存形态（byChar / ops / 旧 entries），就认为干员调配本地非空。 */
+function localEmpty(kind) {
+  if (kind === 'diy') return !hasKeys(loadoutStore.get().diy);
   const s = loadoutStore.get();
   return !hasKeys(s.byChar) && !hasKeys(s.ops) && !hasKeys(s.entries);
 }
 
-function applyPayload(payload) {
+function applyPayload(kind, payload) {
   if (!isObj(payload)) return;
-  const byChar = isObj(payload.byChar) ? payload.byChar : {};
-  const ops = isObj(payload.ops) ? payload.ops : {};
   applying = true;
   try {
+    if (kind === 'diy') {
+      setDiyPicks(isObj(payload.picks) ? payload.picks : {});
+      return;
+    }
+    const byChar = isObj(payload.byChar) ? payload.byChar : {};
+    const ops = isObj(payload.ops) ? payload.ops : {};
     loadoutStore.set({ byChar, ops });
     try { savePref(LOADOUT_PREF, toStored(byChar, ops)); } catch { /* 隐私模式：本次会话仍可用 */ }
     refreshViews();
@@ -72,57 +88,71 @@ async function request(url, options = {}, timeout = FAST_TIMEOUT_MS) {
   }
 }
 
-function scheduleSave() {
+function scheduleSave(kind) {
   if (!enabled || !name) return;
-  dirty = true;
+  dirty[kind] = true;
   if (timer != null) globalThis.clearTimeout(timer);
-  timer = globalThis.setTimeout(() => { timer = null; void saveNow(); }, SAVE_DELAY_MS);
+  timer = globalThis.setTimeout(() => { timer = null; void saveDirty(); }, SAVE_DELAY_MS);
 }
 
-async function saveNow(allowRetry = true) {
+async function saveDirty() {
+  const jobs = KINDS.filter((kind) => dirty[kind]);
+  await Promise.all(jobs.map((kind) => saveNow(kind)));
+}
+
+async function saveNow(kind, allowRetry = true) {
   if (!enabled || !name || !version) return;
-  const payload = currentPayload();
-  if (!hasKeys(payload.byChar) && !hasKeys(payload.ops)) return;
+  const payload = currentPayload(kind);
+  if (!hasPayload(kind, payload)) { dirty[kind] = false; return; }
   try {
     const res = await request(ENDPOINT, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, version, payload, baseRev: rev }),
+      body: JSON.stringify({ name, version, kind, payload, baseRev: revs[kind] }),
     });
     if (res.status === 409 && allowRetry) {
       let json = null;
       try { json = await res.json(); } catch { /* ignore */ }
-      rev = Number(json?.rev) || 0;
+      revs[kind] = Number(json?.rev) || 0;
       // 熟人场景：本地视为最新，带新 rev 重试一次。
-      return await saveNow(false);
+      return await saveNow(kind, false);
     }
-    if (res.status === 404) { enabled = false; dirty = false; return; }
-    if (res.status === 405) { enabled = false; dirty = false; return; }
+    if (res.status === 404 || res.status === 405) {
+      enabled = false;
+      dirty.loadout = false;
+      dirty.diy = false;
+      return;
+    }
     if (!res.ok) {
-      console.warn('[prefs] save refused', res.status);
-      dirty = false;
+      console.warn('[prefs] save refused', kind, res.status);
+      dirty[kind] = false;
       return;
     }
     let json = null;
     try { json = await res.json(); } catch { /* ignore */ }
-    rev = Number(json?.rev) || rev;
-    dirty = false;
+    revs[kind] = Number(json?.rev) || revs[kind];
+    dirty[kind] = false;
   } catch (e) {
-    console.warn('[prefs] save failed', e);
+    console.warn('[prefs] save failed', kind, e);
   }
 }
 
 function sendBeacon() {
-  if (!enabled || !name || !version || !dirty) return;
+  if (!enabled || !name || !version) return;
   if (typeof navigator === 'undefined' || typeof navigator.sendBeacon !== 'function' || typeof Blob === 'undefined') return;
-  const payload = currentPayload();
-  if (!hasKeys(payload.byChar) && !hasKeys(payload.ops)) return;
-  const body = JSON.stringify({ name, version, payload });
-  try {
-    navigator.sendBeacon(ENDPOINT, new Blob([body], { type: 'application/json' }));
-    dirty = false;
-  } catch { /* 忽略：下次编辑或进入时再传 */ }
+  for (const kind of KINDS) {
+    if (!dirty[kind]) continue;
+    const payload = currentPayload(kind);
+    if (!hasPayload(kind, payload)) continue;
+    const body = JSON.stringify({ name, version, kind, payload });
+    try {
+      navigator.sendBeacon(ENDPOINT, new Blob([body], { type: 'application/json' }));
+      dirty[kind] = false;
+    } catch { /* 忽略：下次编辑或进入时再传 */ }
+  }
 }
+
+const profileUrl = (kind) => `${ENDPOINT}?name=${encodeURIComponent(name)}&version=${encodeURIComponent(version)}&kind=${kind}`;
 
 async function syncProfile(msg) {
   if (!enabled) { ready = true; return; }
@@ -139,33 +169,36 @@ async function syncProfile(msg) {
   syncingKey = key;
   ready = false;
   try {
-    const url = `${ENDPOINT}?name=${encodeURIComponent(nextName)}&version=${encodeURIComponent(nextVersion)}`;
-    const res = await request(url);
+    const responses = await Promise.all(KINDS.map((kind) => request(profileUrl(kind))));
     if (seq !== syncSeq) return;
-    if (res.status === 404) {
-      enabled = false;
-      ready = true;
-      notifyReady();
-      return;
+    const results = [];
+    for (const res of responses) {
+      if (res.status === 404 || res.status === 405) { enabled = false; return; }
+      const type = res.headers?.get?.('content-type') || '';
+      if (!type.includes('application/json')) {
+        // 服务端未启用时，静态路由可能回一个 HTML 页面：直接停用，避免后续无意义的上传。
+        enabled = false;
+        return;
+      }
+      if (!res.ok) throw new Error(`GET ${res.status}`);
+      results.push(await res.json());
     }
-    if (!res.ok) throw new Error(`GET ${res.status}`);
-    const type = res.headers?.get?.('content-type') || '';
-    if (!type.includes('application/json')) {
-      // 服务端未启用时，静态路由可能回一个 HTML 页面：直接停用，避免后续无意义的上传。
-      enabled = false;
-      ready = true;
-      notifyReady();
-      return;
-    }
-    const json = await res.json();
     if (seq !== syncSeq) return;
-    rev = Number(json?.rev) || 0;
     loadedKey = key;
-    if (json?.found) {
-      if (localEmpty()) applyPayload(json.payload);
-      else await saveNow();
-    } else if (!localEmpty()) {
-      await saveNow();
+    // 先把自选编队切到当前版本自己的 localStorage 记录，再判断“本地是否为空”（applying 防止这次读取触发上传）。
+    applying = true;
+    try { refreshViews(); } finally { applying = false; }
+    for (let i = 0; i < KINDS.length; i++) {
+      if (seq !== syncSeq) return;
+      const kind = KINDS[i];
+      const json = results[i];
+      revs[kind] = Number(json?.rev) || 0;
+      if (json?.found) {
+        if (localEmpty(kind)) applyPayload(kind, json.payload);
+        else await saveNow(kind);
+      } else if (!localEmpty(kind)) {
+        await saveNow(kind);
+      }
     }
   } catch (e) {
     console.warn('[prefs] load failed', e);
@@ -179,7 +212,7 @@ async function syncProfile(msg) {
 }
 
 /**
- * Wire the preference bridge once, after the loadout sync is installed.
+ * Wire the preference bridge once, after the loadout / diy syncs are installed.
  * @param {{ net: any, onReady?: () => void }} deps
  */
 export function initPrefsLoadout({ net, onReady = null } = {}) {
@@ -192,10 +225,9 @@ export function initPrefsLoadout({ net, onReady = null } = {}) {
   const knownName = store.get().me?.name;
   if (net.status === 'online' && typeof knownName === 'string' && knownName.trim()) void syncProfile({ name: knownName });
   loadoutStore.subscribe((s, prev) => {
-    if (applying) return;
-    if (s.byChar === prev.byChar && s.ops === prev.ops) return;
-    if (!name) return;
-    scheduleSave();
+    if (applying || !name) return;
+    if (s.byChar !== prev.byChar || s.ops !== prev.ops) scheduleSave('loadout');
+    if (s.diy !== prev.diy) scheduleSave('diy');
   });
   if (typeof globalThis.addEventListener === 'function') globalThis.addEventListener('pagehide', sendBeacon);
   return { gate: prefsGate };

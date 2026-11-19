@@ -88,7 +88,7 @@ const wantsTraffic = (query) => /(?:^|&)traffic(?:=(?:1|true|yes))?(?:&|$)/i.tes
  *           prefs?: { handle: (req: any, res: any) => Promise<void> } | null,
  *           studio?: { handles: (rawPath: string) => boolean, handle: (req: any, res: any, rawPath: string, query: string) => Promise<void> } | null }} deps
  *   trustProxy: whose forwarding headers name the client (net.js clientAddress; the server's TRUST_PROXY); studio: the
- *   plugin studio (server/studio/index.js), or none; prefs: the optional /prefs/loadout SQLite sidecar (server/prefsLoadout.js)
+ *   plugin studio (server/studio/index.js), or none; prefs: the optional /prefs/loadout SQLite sidecar for loadout/diy (server/prefsLoadout.js)
  * @returns {(req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => void}
  */
 export function createRequestHandler({ serveStatic, health, log, trustProxy = 'auto', studio = null, csp = null, trustedRuntime = null, prefs = null }) {

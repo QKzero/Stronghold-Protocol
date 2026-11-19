@@ -446,15 +446,15 @@ async function boot() {
   installSettingsViews();
   const loadoutSync = installLoadoutSync({ net, gate: (ctx) => prefsGate() && canSendSettings(ctx) });
   installOwnershipSync({ net });
-  installDiySync({ net });
+  const diySync = installDiySync({ net, gate: (ctx) => prefsGate() && canSendSettings(ctx) });
   // 干员皮肤 (docs/SKINS.md): keeps the server's copy of this browser's chosen appearances current (room.skins), from
   // ui/skins.js' own store — its 皮肤 section is rendered by screens/loadout.js.
   installSkinsSync({ net });
   // 名片干员 (PR #643 split 6): the operator on this browser's seat card (room.card, ui/seatArt.js cardStore) — after every
   // welcome, pick and content change, with the engine's retries (the room screen only reads and sets the pick)
   installCardSync({ net });
-  // 干员调配的跨浏览器恢复（仅 loadout，按昵称；SP_PREFS=1 时服务端才有 /prefs/loadout）
-  initPrefsLoadout({ net, onReady: () => { void loadoutSync.flush(); } });
+  // 干员调配 + 自选编队的跨浏览器恢复（按昵称；SP_PREFS=1 时服务端才有 /prefs/loadout）
+  initPrefsLoadout({ net, onReady: () => { void loadoutSync.flush(); void diySync.flush(); } });
   // the room's cosmetic plugins and the player's own over the art manifest (content.js; nothing is fetched without them)
   installContent({ toast });
   // a room with gameplay plugins: its content set downloaded, checked and shown (content.js — DESIGN §32.6)
