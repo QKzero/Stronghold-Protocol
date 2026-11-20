@@ -177,6 +177,7 @@ export async function createPrefsLoadout({ log = console, data: defaultData = nu
         slug_version TEXT NOT NULL,     -- 官方版本 id（如 act2autochess@V2_1），按版本隔离配置
         "value" TEXT NOT NULL,          -- 偏好内容 JSON：loadout 为 { byChar, ops }；diy 为 { picks }
         row_version INTEGER NOT NULL,   -- 乐观锁修订号：每次成功写入 +1，用于 409 冲突检测
+        create_time INTEGER NOT NULL,   -- 本条偏好首次写入时间（毫秒时间戳），之后不再变更
         modify_time INTEGER NOT NULL,   -- 本条偏好的最后修改时间（毫秒时间戳）
         PRIMARY KEY (user_code, type, slug_version)
       );
@@ -194,9 +195,9 @@ export async function createPrefsLoadout({ log = console, data: defaultData = nu
     INSERT INTO "user" (user_code, name, create_time, modify_time) VALUES (?, ?, ?, ?)
     ON CONFLICT(user_code) DO UPDATE SET name = excluded.name, modify_time = excluded.modify_time
   `);
-  // 偏好 upsert：同一 (user_code, type, slug_version) 覆盖 value、row_version 与 modify_time。
+  // 偏好 upsert：同一 (user_code, type, slug_version) 覆盖 value、row_version 与 modify_time；create_time 只在首次插入时写入。
   const upsertPreference = db.prepare(`
-    INSERT INTO preference (user_code, type, slug_version, "value", row_version, modify_time) VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO preference (user_code, type, slug_version, "value", row_version, create_time, modify_time) VALUES (?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(user_code, type, slug_version) DO UPDATE SET "value" = excluded."value", row_version = excluded.row_version, modify_time = excluded.modify_time
   `);
 
@@ -236,7 +237,7 @@ export async function createPrefsLoadout({ log = console, data: defaultData = nu
     db.exec('BEGIN IMMEDIATE');
     try {
       upsertUser.run(code, name, now, now);
-      upsertPreference.run(code, kind, version, JSON.stringify(payload), nextRev, now);
+      upsertPreference.run(code, kind, version, JSON.stringify(payload), nextRev, now, now);
       db.exec('COMMIT');
     } catch (e) {
       try { db.exec('ROLLBACK'); } catch { /* ignore */ }
